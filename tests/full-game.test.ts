@@ -4,9 +4,13 @@ import { io as connect, type Socket } from 'socket.io-client'
 import { gameRegistry } from '../src/games/registry'
 import type { Mark, TicTacToeView } from '../src/games/tic-tac-toe/logic'
 import { createGameServer } from '../src/server/app'
+import { createSessionValue, SESSION_COOKIE } from '../src/server/auth/tokens'
 import { createRoom, type ServiceDeps } from '../src/server/rooms/service'
 import { createRoomStore } from '../src/server/rooms/store'
 import { ClientEvents, ServerEvents, type SyncPayload } from '../src/shared/events'
+
+/** The handshake auth is part of the flow, so the test mints real credentials. */
+const SESSION_SECRET = 'test-session-secret'
 
 let server: Awaited<ReturnType<typeof createGameServer>>
 let deps: ServiceDeps
@@ -15,7 +19,7 @@ const clients: Socket[] = []
 
 beforeEach(async () => {
   deps = { store: createRoomStore(), games: gameRegistry, now: () => Date.now() }
-  server = await createGameServer({ withNext: false, deps })
+  server = await createGameServer({ withNext: false, deps, sessionSecret: SESSION_SECRET })
   await new Promise<void>((resolve) => server.httpServer.listen(0, resolve))
   url = `http://127.0.0.1:${(server.httpServer.address() as AddressInfo).port}`
 })
@@ -25,8 +29,13 @@ afterEach(async () => {
   await server.close()
 })
 
-function client(): Socket {
-  const socket = connect(url, { transports: ['websocket'], forceNew: true })
+function client(roomId: string): Socket {
+  const socket = connect(url, {
+    transports: ['websocket'],
+    forceNew: true,
+    auth: { roomId },
+    extraHeaders: { cookie: `${SESSION_COOKIE}=${createSessionValue(Date.now(), SESSION_SECRET)}` },
+  })
   clients.push(socket)
   return socket
 }
@@ -52,8 +61,8 @@ describe('full game over the wire', () => {
     //    The host must also drain its own copy of the broadcast the guest's join
     //    triggers (every socket in the room gets a SYNC, not just the actor), so it
     //    can't be mistaken for a later sync.
-    const host = client()
-    let guest = client()
+    const host = client(roomId)
+    let guest = client(roomId)
     await join(host, roomId, 'p1', '小明')
     const hostSeesGuestJoin = nextSync(host)
     const guestJoined = await join(guest, roomId, 'p2', '小红')
@@ -115,7 +124,7 @@ describe('full game over the wire', () => {
     guest.close()
     expect((await hostSeesDrop).room.players.find((p) => p.id === 'p2')!.connected).toBe(false)
 
-    guest = client()
+    guest = client(roomId)
     const rejoined = await join(guest, roomId, 'p2', 'ignored-on-reconnect')
     expect(rejoined.room.players.find((p) => p.id === 'p2')).toMatchObject({
       name: '小花',

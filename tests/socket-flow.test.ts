@@ -4,9 +4,19 @@ import { io as connect, type Socket } from 'socket.io-client'
 import { gameRegistry } from '../src/games/registry'
 import type { TicTacToeView } from '../src/games/tic-tac-toe/logic'
 import { createGameServer } from '../src/server/app'
+import {
+  createGrantValue,
+  createSessionValue,
+  grantCookieName,
+  SESSION_COOKIE,
+} from '../src/server/auth/tokens'
 import { createRoom, type ServiceDeps } from '../src/server/rooms/service'
 import { createRoomStore } from '../src/server/rooms/store'
+import { SOCKET_AUTH_ERROR } from '../src/server/socket/auth'
 import { ClientEvents, ServerEvents, type ErrorPayload, type SyncPayload } from '../src/shared/events'
+
+/** The handshake auth is under test too, so the tests mint real credentials. */
+const SESSION_SECRET = 'test-session-secret'
 
 let server: Awaited<ReturnType<typeof createGameServer>>
 let deps: ServiceDeps
@@ -15,7 +25,7 @@ const clients: Socket[] = []
 
 beforeEach(async () => {
   deps = { store: createRoomStore(), games: gameRegistry, now: () => Date.now() }
-  server = await createGameServer({ withNext: false, deps })
+  server = await createGameServer({ withNext: false, deps, sessionSecret: SESSION_SECRET })
   await new Promise<void>((resolve) => server.httpServer.listen(0, resolve))
   const address = server.httpServer.address() as AddressInfo
   url = `http://127.0.0.1:${address.port}`
@@ -26,8 +36,18 @@ afterEach(async () => {
   await server.close()
 })
 
-function client(): Socket {
-  const socket = connect(url, { transports: ['websocket'], forceNew: true })
+function sessionCookie(): string {
+  return `${SESSION_COOKIE}=${createSessionValue(Date.now(), SESSION_SECRET)}`
+}
+
+/** Connects the way a logged-in browser does: site session cookie + room claim. */
+function client(roomId: string, cookie: string = sessionCookie()): Socket {
+  const socket = connect(url, {
+    transports: ['websocket'],
+    forceNew: true,
+    auth: { roomId },
+    extraHeaders: { cookie },
+  })
   clients.push(socket)
   return socket
 }
@@ -49,7 +69,7 @@ function makeRoom(): string {
 describe('socket flow', () => {
   it('syncs the room back to a joining player', async () => {
     const roomId = makeRoom()
-    const socket = client()
+    const socket = client(roomId)
     const sync = nextSync(socket)
     socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: '小明' })
     const payload = await sync
@@ -62,20 +82,22 @@ describe('socket flow', () => {
 
   it('broadcasts the new roster to everyone in the room', async () => {
     const roomId = makeRoom()
-    const host = client()
+    const host = client(roomId)
     const hostSync = nextSync(host)
     host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: '小明' })
     await hostSync
 
     const hostSeesGuest = nextSync(host)
-    const guest = client()
+    const guest = client(roomId)
     guest.emit(ClientEvents.JOIN, { roomId, playerId: 'p2', name: '小红' })
     const payload = await hostSeesGuest
     expect(payload.room.players.map((player) => player.name)).toEqual(['小明', '小红'])
   })
 
   it('reports a missing room as an error rather than a sync', async () => {
-    const socket = client()
+    // A site session authorises any room, so the handshake passes and the
+    // "no such room" answer comes from the service layer as before.
+    const socket = client('NOPE12')
     const error = nextError(socket)
     socket.emit(ClientEvents.JOIN, { roomId: 'NOPE12', playerId: 'p1' })
     expect(await error).toEqual({ code: 'ROOM_NOT_FOUND', message: '房间不存在或已过期' })
@@ -83,7 +105,7 @@ describe('socket flow', () => {
 
   it('renames a player and broadcasts it', async () => {
     const roomId = makeRoom()
-    const socket = client()
+    const socket = client(roomId)
     const joined = nextSync(socket)
     socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
     await joined
@@ -95,8 +117,8 @@ describe('socket flow', () => {
 
   it('lets the host start the game and gives each player their own view', async () => {
     const roomId = makeRoom()
-    const host = client()
-    const guest = client()
+    const host = client(roomId)
+    const guest = client(roomId)
     const hostJoined = nextSync(host)
     host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
     await hostJoined
@@ -117,8 +139,8 @@ describe('socket flow', () => {
 
   it('rejects a start from a non-host', async () => {
     const roomId = makeRoom()
-    const host = client()
-    const guest = client()
+    const host = client(roomId)
+    const guest = client(roomId)
     const hostJoined = nextSync(host)
     host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
     await hostJoined
@@ -133,8 +155,8 @@ describe('socket flow', () => {
 
   it('sends an illegal move back only to the player who made it', async () => {
     const roomId = makeRoom()
-    const host = client()
-    const guest = client()
+    const host = client(roomId)
+    const guest = client(roomId)
     const hostJoined = nextSync(host)
     host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
     await hostJoined
@@ -154,8 +176,8 @@ describe('socket flow', () => {
 
   it('marks a player offline when their socket drops', async () => {
     const roomId = makeRoom()
-    const host = client()
-    const guest = client()
+    const host = client(roomId)
+    const guest = client(roomId)
     const hostJoined = nextSync(host)
     host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
     await hostJoined
@@ -176,7 +198,7 @@ describe('malformed payloads', () => {
   // it every room on the server.
   it('rejects a join whose name is not a string, and keeps serving', async () => {
     const roomId = makeRoom()
-    const socket = client()
+    const socket = client(roomId)
     const error = nextError(socket)
     socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: { evil: true } })
     expect(await error).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
@@ -189,8 +211,8 @@ describe('malformed payloads', () => {
 
   it('rejects an action with no payload at all, and keeps serving', async () => {
     const roomId = makeRoom()
-    const host = client()
-    const guest = client()
+    const host = client(roomId)
+    const guest = client(roomId)
     const hostJoined = nextSync(host)
     host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
     await hostJoined
@@ -227,7 +249,7 @@ describe('malformed payloads', () => {
 
   it('rejects a rename whose name is not a string', async () => {
     const roomId = makeRoom()
-    const socket = client()
+    const socket = client(roomId)
     const joined = nextSync(socket)
     socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
     await joined
@@ -254,7 +276,11 @@ describe('malformed payloads', () => {
       },
     }
     const brokenDeps: ServiceDeps = { ...deps, games: throwing }
-    const broken = await createGameServer({ withNext: false, deps: brokenDeps })
+    const broken = await createGameServer({
+      withNext: false,
+      deps: brokenDeps,
+      sessionSecret: SESSION_SECRET,
+    })
     await new Promise<void>((resolve) => broken.httpServer.listen(0, resolve))
     const brokenUrl = `http://127.0.0.1:${(broken.httpServer.address() as AddressInfo).port}`
 
@@ -263,7 +289,12 @@ describe('malformed payloads', () => {
       if (!created.ok) throw new Error(created.message)
       const roomId = created.value.id
       const sockets = ['p1', 'p2'].map((playerId) => {
-        const socket = connect(brokenUrl, { transports: ['websocket'], forceNew: true })
+        const socket = connect(brokenUrl, {
+          transports: ['websocket'],
+          forceNew: true,
+          auth: { roomId },
+          extraHeaders: { cookie: sessionCookie() },
+        })
         clients.push(socket)
         return { socket, playerId }
       })
@@ -284,5 +315,66 @@ describe('malformed payloads', () => {
     } finally {
       await broken.close()
     }
+  })
+})
+
+describe('handshake auth', () => {
+  function connectError(socket: Socket): Promise<string> {
+    return new Promise((resolve) => socket.once('connect_error', (cause) => resolve(cause.message)))
+  }
+
+  function rawClient(options: Record<string, unknown>): Socket {
+    const socket = connect(url, { transports: ['websocket'], forceNew: true, ...options })
+    clients.push(socket)
+    return socket
+  }
+
+  it('rejects a handshake that carries no cookies at all', async () => {
+    const roomId = makeRoom()
+    const socket = rawClient({ auth: { roomId } })
+    expect(await connectError(socket)).toBe(SOCKET_AUTH_ERROR)
+    expect(socket.connected).toBe(false)
+  })
+
+  it('rejects a handshake that declares no room', async () => {
+    makeRoom()
+    const socket = rawClient({ extraHeaders: { cookie: sessionCookie() } })
+    expect(await connectError(socket)).toBe(SOCKET_AUTH_ERROR)
+  })
+
+  it('rejects a forged session cookie', async () => {
+    const roomId = makeRoom()
+    const socket = rawClient({
+      auth: { roomId },
+      extraHeaders: { cookie: `${SESSION_COOKIE}=session:${Date.now()}.deadbeef` },
+    })
+    expect(await connectError(socket)).toBe(SOCKET_AUTH_ERROR)
+  })
+
+  it('accepts an invite grant for that room', async () => {
+    const roomId = makeRoom()
+    const grant = `${grantCookieName(roomId)}=${createGrantValue(roomId, Date.now(), SESSION_SECRET)}`
+    const socket = client(roomId, grant)
+    const sync = nextSync(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: '客人' })
+    expect((await sync).room.id).toBe(roomId)
+  })
+
+  it('does not let a grant for one room open another', async () => {
+    const mine = makeRoom()
+    const other = makeRoom()
+    const grant = `${grantCookieName(mine)}=${createGrantValue(mine, Date.now(), SESSION_SECRET)}`
+    const socket = rawClient({ auth: { roomId: other }, extraHeaders: { cookie: grant } })
+    expect(await connectError(socket)).toBe(SOCKET_AUTH_ERROR)
+  })
+
+  it('refuses to join a room the handshake was not authorised for', async () => {
+    const mine = makeRoom()
+    const other = makeRoom()
+    const grant = `${grantCookieName(mine)}=${createGrantValue(mine, Date.now(), SESSION_SECRET)}`
+    const socket = client(mine, grant)
+    const error = nextError(socket)
+    socket.emit(ClientEvents.JOIN, { roomId: other, playerId: 'p1' })
+    expect(await error).toEqual({ code: 'FORBIDDEN', message: '你没有权限进入这个房间' })
   })
 })

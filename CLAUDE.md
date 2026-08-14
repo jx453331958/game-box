@@ -35,7 +35,10 @@ src/games/**  →  src/server/rooms/**  →  src/server/socket/**
   `GameRegistry` 间接调用。
 - **`src/server/socket/**`**：不写业务逻辑，只做"Socket 事件 → 调用 service → 把结果
   广播给房间里的每个人"这一件事（见 `src/server/socket/handlers.ts` 的 `broadcast`：
-  对每个连接分别调用 `game.getViewFor` 裁剪视图后再发）。
+  对每个连接分别调用 `game.getViewFor` 裁剪视图后再发）。两件传输层自己的事也在这里：
+  **收到的 payload 一律先做类型守卫**、**每个 handler 外面包 try/catch**
+  （Socket.IO 不接住监听器里抛出的异常，漏一个就是整个进程挂掉、所有房间一起没），
+  以及握手鉴权（`src/server/socket/auth.ts`）。
 
 ## 导入路径规则
 
@@ -61,6 +64,23 @@ src/games/**  →  src/server/rooms/**  →  src/server/socket/**
 房间会存在 Next 那份实例里，Socket.IO 那份实例完全看不到——建房成功但谁都进不去，且
 不会抛任何异常。**任何时候要往骨架层加新的跨侧共享状态，都走 `runtime.ts` 这个
 `globalThis` 单例模式，不要开新的模块级变量。**
+
+## ⚠️ 必须先解决的遗留问题：`playerId` 可伪造
+
+Socket 握手已经有鉴权（`src/server/socket/auth.ts` 的 `io.use` 中间件校验站点 session
+或房间 grant，`room:join` 再核对房间号一致），挡住了**房间外**的人。但**房间内**还有一个
+没修的洞：
+
+`playerId` 由浏览器自己生成（`src/lib/playerId.ts`），`room:join` 时自称，服务端不做任何
+校验；同时它会作为 `RoomPublic.players[].id` 广播给房间里的每一个人。**所以同一房间的成员
+可以拿到别人的 `playerId`，用它连上来，收到那个人的私有 `gameView` 并以他的身份出牌。**
+
+- 井字棋没有隐藏信息，目前影响仅限于捣乱。
+- **在 `src/games/` 下新增任何有隐藏信息的游戏（狼人杀 / 阿瓦隆 类）之前，必须先修掉
+  这个问题**：`GameLogic.getViewFor` 是这类游戏唯一的防线，它按 `playerId` 裁剪视图，
+  `playerId` 可伪造 = 防线不存在。
+- 修法需要产品侧拍板（服务端签发玩家身份 cookie，或把 `playerId` 与 session/grant 绑定
+  后由服务端下发），涉及身份模型改动，不要在没确认方案的情况下顺手改。
 
 ## 新增游戏
 

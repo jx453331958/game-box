@@ -2,7 +2,8 @@ import { createServer, type Server as HttpServer } from 'node:http'
 import { Server as SocketServer } from 'socket.io'
 import { startCleanupTimer } from './rooms/cleanup'
 import type { ServiceDeps } from './rooms/service'
-import { getServiceDeps } from './runtime'
+import { getConfig, getServiceDeps } from './runtime'
+import { createSocketAuthMiddleware } from './socket/auth'
 import { registerSocketHandlers } from './socket/handlers'
 
 export type GameServerOptions = {
@@ -10,6 +11,12 @@ export type GameServerOptions = {
   withNext: boolean
   dev?: boolean
   deps?: ServiceDeps
+  /**
+   * Secret the handshake auth verifies session/grant cookies against. Injected
+   * explicitly by tests, exactly like `deps`; production falls back to the
+   * boot config.
+   */
+  sessionSecret?: string
 }
 
 export type GameServer = {
@@ -20,6 +27,7 @@ export type GameServer = {
 
 export async function createGameServer(options: GameServerOptions): Promise<GameServer> {
   const deps = options.deps ?? getServiceDeps()
+  const sessionSecret = options.sessionSecret ?? getConfig().sessionSecret
   let handleNextRequest: ((req: never, res: never) => void) | null = null
   let closeNext: (() => Promise<void>) | null = null
 
@@ -42,6 +50,7 @@ export async function createGameServer(options: GameServerOptions): Promise<Game
   })
 
   const io = new SocketServer(httpServer, { path: '/socket.io' })
+  io.use(createSocketAuthMiddleware({ sessionSecret, now: deps.now }))
   registerSocketHandlers(io, deps)
   const stopCleanup = startCleanupTimer(deps.store, deps.now)
 

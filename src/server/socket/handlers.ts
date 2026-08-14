@@ -12,6 +12,7 @@ import {
   type ServiceResult,
 } from '../rooms/service'
 import type { Room } from '../rooms/store'
+import { authorizedRoomId } from './auth'
 
 type SocketIdentity = { roomId: string; playerId: string }
 
@@ -25,6 +26,14 @@ export function registerSocketHandlers(io: Server, deps: ServiceDeps): void {
       guarded(socket, ClientEvents.JOIN, () => {
         const join = parseJoin(payload)
         if (join === null) return emitError(socket, 'BAD_PAYLOAD', BAD_PAYLOAD_MESSAGE)
+
+        // The handshake was authorised for exactly one room. Trusting the room
+        // id claimed here instead would make the middleware no protection at all.
+        const authorized = authorizedRoomId(socket)
+        if (authorized === undefined || authorized !== join.roomId) {
+          return emitError(socket, 'FORBIDDEN', '你没有权限进入这个房间')
+        }
+
         const result = joinRoom(deps, join)
         if (!handled(socket, result)) return
         identities.set(socket, { roomId: join.roomId, playerId: join.playerId })

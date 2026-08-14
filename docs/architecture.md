@@ -78,6 +78,34 @@ src/server/socket/**   （事件收发、广播）
 `playerId` 和前两者是正交的：cookie 决定"能不能进这个房间"，`playerId` 决定"你在房间
 里是谁"（对应 `room.players` 里的哪个 `Player`、`GameLogic` 视图里裁剪给谁看）。
 
+### Socket 握手鉴权
+
+`src/server/auth/guards.ts` 只保护 Next 页面和路由处理器，但**真正的数据平面是
+Socket**——花名册、每个人的私有 `gameView`、房间的邀请 token 全部走这条连接。所以握手
+本身必须再查一遍凭证，这件事由 `src/server/socket/auth.ts` 的
+`createSocketAuthMiddleware` 完成（在 `src/server/app.ts` 里 `io.use(...)` 装上）：
+
+1. 客户端在 `io({ auth: { roomId } })` 里声明自己要进哪个房间
+   （`src/hooks/useRoomSocket.ts`）——握手阶段服务端没有别的办法知道房间号。
+2. 中间件解析 `socket.handshake.headers.cookie`（同源连接浏览器会自动带上），对这个
+   `roomId` 校验站点 session 或该房间的 grant，任一通过即放行，否则
+   `next(new Error(...))`，客户端在 `connect_error` 里拿到中文提示并停止重连。
+3. 放行时把这个 `roomId` 记下来；`room:join` 处理器**再核对一次**加入的房间就是握手时
+   被授权的那个，不一致返回 `FORBIDDEN`。**这一步不能省**——中间件如果信任后来才发来的
+   房间号，等于没有防护。
+
+### 已知缺口：`playerId` 是自称的
+
+`playerId` 完全由客户端生成并在 `room:join` 里自称，服务端不做任何校验，而且它会随
+`RoomPublic.players` 广播给房间里的每一个人。也就是说：**同一个房间里的成员可以拿到
+别人的 `playerId`，用它重连，从而拿到那个人的私有 `gameView` 并以他的身份行动。**
+
+握手鉴权挡住的是"房间外的人"，挡不住"房间里的人冒充另一个人"。井字棋没有隐藏信息，
+影响仅限于捣乱；但**在加入任何有隐藏信息的游戏（狼人杀 / 阿瓦隆 类）之前必须先解决
+这个问题**——`getViewFor` 是这类游戏唯一的防线，而它是按 `playerId` 裁剪的，`playerId`
+可伪造就等于这道防线不存在。修法需要产品侧决策（服务端签发玩家身份 cookie、或把
+`playerId` 与 session/grant 绑定），不是骨架层能单方面改掉的。
+
 ## 房间生命周期与清理规则
 
 房间状态机：`waiting` → `playing` → `finished`（`RoomStatus`，`src/shared/types.ts`）。

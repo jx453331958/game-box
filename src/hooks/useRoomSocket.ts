@@ -34,7 +34,14 @@ export function useRoomSocket(roomId: string): RoomSocket {
     const id = getOrCreatePlayerId()
     setPlayerId(id)
 
-    const socket = io({ path: '/socket.io', transports: ['websocket', 'polling'] })
+    // `auth.roomId` is what the handshake middleware verifies the session or
+    // room grant against. Cookies ride along automatically on a same-origin
+    // connection, so nothing else has to be passed here.
+    const socket = io({
+      path: '/socket.io',
+      transports: ['websocket', 'polling'],
+      auth: { roomId },
+    })
     socketRef.current = socket
 
     // Re-join on every connect so a reconnect restores the seat automatically.
@@ -43,6 +50,14 @@ export function useRoomSocket(roomId: string): RoomSocket {
       socket.emit(ClientEvents.JOIN, { roomId, playerId: id })
     })
     socket.on('disconnect', () => setConnected(false))
+    // A rejected handshake leaves `socket.active` false and stops reconnecting,
+    // so surface its message instead of hanging on "正在连接…" forever. A
+    // transient network error keeps `active` true and retries on its own.
+    socket.on('connect_error', (cause: Error) => {
+      setConnected(false)
+      if (socket.active) return
+      setError({ code: 'CONNECT_REJECTED', message: cause.message })
+    })
     socket.on(ServerEvents.SYNC, (payload: SyncPayload) => {
       setRoom(payload.room)
       setGameView(payload.gameView)
