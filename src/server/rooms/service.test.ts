@@ -1,7 +1,18 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { gameRegistry } from '../../games/registry'
 import { createRoomStore } from './store'
-import { createRoom, joinRoom, renamePlayer, toPublicRoom, type ServiceDeps } from './service'
+import {
+  applyGameAction,
+  createRoom,
+  joinRoom,
+  markDisconnected,
+  renamePlayer,
+  startGame,
+  toPublicRoom,
+  viewFor,
+  type ServiceDeps,
+} from './service'
+import type { TicTacToeState, TicTacToeView } from '../../games/tic-tac-toe/logic'
 
 let clock = 1000
 let deps: ServiceDeps
@@ -206,5 +217,175 @@ describe('toPublicRoom', () => {
       players: [{ id: 'p1', name: '小明', seat: 0, connected: true }],
       winners: [],
     })
+  })
+})
+
+function seatedRoom(): string {
+  const roomId = newRoomId()
+  joinRoom(deps, { roomId, playerId: 'p1', name: '小明' })
+  joinRoom(deps, { roomId, playerId: 'p2', name: '小红' })
+  return roomId
+}
+
+describe('startGame', () => {
+  it('starts the game and seeds the initial state', () => {
+    const roomId = seatedRoom()
+    const result = startGame(deps, { roomId, playerId: 'p1' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.status).toBe('playing')
+    expect(result.value.seed).not.toBe('')
+    const state = result.value.gameState as TicTacToeState
+    expect(state.board).toEqual(Array(9).fill(null))
+  })
+
+  it('rejects a non-host', () => {
+    const roomId = seatedRoom()
+    expect(startGame(deps, { roomId, playerId: 'p2' })).toEqual({
+      ok: false,
+      code: 'NOT_HOST',
+      message: '只有房主可以开始游戏',
+    })
+  })
+
+  it('rejects too few players', () => {
+    const roomId = newRoomId()
+    joinRoom(deps, { roomId, playerId: 'p1' })
+    expect(startGame(deps, { roomId, playerId: 'p1' })).toEqual({
+      ok: false,
+      code: 'NOT_ENOUGH_PLAYERS',
+      message: '人数不够，至少需要 2 人',
+    })
+  })
+
+  it('rejects starting a game that is already running', () => {
+    const roomId = seatedRoom()
+    startGame(deps, { roomId, playerId: 'p1' })
+    expect(startGame(deps, { roomId, playerId: 'p1' })).toEqual({
+      ok: false,
+      code: 'NOT_WAITING',
+      message: '对局已经开始了',
+    })
+  })
+
+  it('rejects an unknown room', () => {
+    expect(startGame(deps, { roomId: 'NOPE12', playerId: 'p1' })).toEqual({
+      ok: false,
+      code: 'ROOM_NOT_FOUND',
+      message: '房间不存在或已过期',
+    })
+  })
+})
+
+describe('applyGameAction', () => {
+  function currentPlayer(roomId: string): string {
+    const state = deps.store.get(roomId)!.gameState as TicTacToeState
+    return state.order[state.turn]!
+  }
+
+  it('applies a legal move', () => {
+    const roomId = seatedRoom()
+    startGame(deps, { roomId, playerId: 'p1' })
+    const mover = currentPlayer(roomId)
+    const result = applyGameAction(deps, { roomId, playerId: mover, action: { type: 'place', cell: 4 } })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect((result.value.gameState as TicTacToeState).board[4]).toBe(mover)
+  })
+
+  it('passes the game layer rejection through as INVALID_ACTION', () => {
+    const roomId = seatedRoom()
+    startGame(deps, { roomId, playerId: 'p1' })
+    const waiting = currentPlayer(roomId) === 'p1' ? 'p2' : 'p1'
+    expect(applyGameAction(deps, { roomId, playerId: waiting, action: { type: 'place', cell: 0 } })).toEqual({
+      ok: false,
+      code: 'INVALID_ACTION',
+      message: '还没轮到你',
+    })
+  })
+
+  it('marks the room finished once the game ends', () => {
+    const roomId = seatedRoom()
+    startGame(deps, { roomId, playerId: 'p1' })
+    const x = currentPlayer(roomId)
+    const o = x === 'p1' ? 'p2' : 'p1'
+    for (const [player, cell] of [[x, 0], [o, 3], [x, 1], [o, 4], [x, 2]] as const) {
+      const result = applyGameAction(deps, { roomId, playerId: player, action: { type: 'place', cell } })
+      expect(result.ok).toBe(true)
+    }
+    const room = deps.store.get(roomId)!
+    expect(room.status).toBe('finished')
+    expect(toPublicRoom(deps, room).winners).toEqual([x])
+  })
+
+  it('rejects an action while the room is still waiting', () => {
+    const roomId = seatedRoom()
+    expect(applyGameAction(deps, { roomId, playerId: 'p1', action: { type: 'place', cell: 0 } })).toEqual({
+      ok: false,
+      code: 'NOT_PLAYING',
+      message: '对局还没有开始',
+    })
+  })
+
+  it('rejects a player who is not in the room', () => {
+    const roomId = seatedRoom()
+    startGame(deps, { roomId, playerId: 'p1' })
+    expect(applyGameAction(deps, { roomId, playerId: 'ghost', action: { type: 'place', cell: 0 } })).toEqual({
+      ok: false,
+      code: 'NOT_IN_ROOM',
+      message: '你不在这个房间里',
+    })
+  })
+})
+
+describe('markDisconnected', () => {
+  it('keeps the seat and flips connected to false', () => {
+    const roomId = seatedRoom()
+    const result = markDisconnected(deps, { roomId, playerId: 'p2' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.players).toHaveLength(2)
+    expect(result.value.players[1]).toMatchObject({ id: 'p2', connected: false, seat: 1 })
+  })
+
+  it('transfers the host to the next connected player', () => {
+    const roomId = seatedRoom()
+    const result = markDisconnected(deps, { roomId, playerId: 'p1' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.hostId).toBe('p2')
+  })
+
+  it('keeps the host when nobody else is connected', () => {
+    const roomId = seatedRoom()
+    markDisconnected(deps, { roomId, playerId: 'p2' })
+    const result = markDisconnected(deps, { roomId, playerId: 'p1' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.hostId).toBe('p1')
+  })
+
+  it('ignores a player who is not in the room', () => {
+    const roomId = seatedRoom()
+    expect(markDisconnected(deps, { roomId, playerId: 'ghost' })).toEqual({
+      ok: false,
+      code: 'NOT_IN_ROOM',
+      message: '你不在这个房间里',
+    })
+  })
+})
+
+describe('viewFor', () => {
+  it('returns null before the game starts', () => {
+    const roomId = seatedRoom()
+    expect(viewFor(deps, deps.store.get(roomId)!, 'p1')).toBeNull()
+  })
+
+  it('returns the per-player view once playing', () => {
+    const roomId = seatedRoom()
+    startGame(deps, { roomId, playerId: 'p1' })
+    const view = viewFor(deps, deps.store.get(roomId)!, 'p1') as TicTacToeView
+    expect(view.cells).toHaveLength(9)
+    expect(['X', 'O']).toContain(view.myMark)
   })
 })

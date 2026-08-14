@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import type { GameRegistry } from '../../games/registry'
 import { generateInviteToken, generateRoomCode } from '../../shared/ids'
 import type { PlayerPublic, RoomPublic } from '../../shared/types'
@@ -138,4 +139,84 @@ function dedupeName(name: string, others: Player[]): string {
   let suffix = 2
   while (taken.has(`${name}${suffix}`)) suffix += 1
   return `${name}${suffix}`
+}
+
+export function startGame(
+  deps: ServiceDeps,
+  params: { roomId: string; playerId: string },
+): ServiceResult<Room> {
+  const room = deps.store.get(params.roomId)
+  if (room === undefined) return fail('ROOM_NOT_FOUND', '房间不存在或已过期')
+  if (room.status !== 'waiting') return fail('NOT_WAITING', '对局已经开始了')
+  if (room.hostId !== params.playerId) return fail('NOT_HOST', '只有房主可以开始游戏')
+
+  const game = deps.games.get(room.gameId)
+  if (game === undefined) return fail('GAME_NOT_FOUND', '没有这个游戏')
+  if (room.players.length < game.meta.minPlayers) {
+    return fail('NOT_ENOUGH_PLAYERS', `人数不够，至少需要 ${game.meta.minPlayers} 人`)
+  }
+  if (room.players.length > game.meta.maxPlayers) {
+    return fail('TOO_MANY_PLAYERS', `人数过多，最多 ${game.meta.maxPlayers} 人`)
+  }
+
+  room.seed = randomBytes(16).toString('hex')
+  room.gameState = game.createInitialState(
+    room.players.map((player) => ({ id: player.id, name: player.name, seat: player.seat })),
+    room.seed,
+  )
+  room.status = 'playing'
+  touch(deps, room)
+  return { ok: true, value: room }
+}
+
+export function applyGameAction(
+  deps: ServiceDeps,
+  params: { roomId: string; playerId: string; action: unknown },
+): ServiceResult<Room> {
+  const room = deps.store.get(params.roomId)
+  if (room === undefined) return fail('ROOM_NOT_FOUND', '房间不存在或已过期')
+  if (!room.players.some((player) => player.id === params.playerId)) {
+    return fail('NOT_IN_ROOM', '你不在这个房间里')
+  }
+  if (room.status !== 'playing') return fail('NOT_PLAYING', '对局还没有开始')
+
+  const game = deps.games.get(room.gameId)
+  if (game === undefined) return fail('GAME_NOT_FOUND', '没有这个游戏')
+
+  const result = game.applyAction(room.gameState, params.playerId, params.action)
+  if (!result.ok) return fail('INVALID_ACTION', result.reason)
+
+  room.gameState = result.state
+  if (game.isFinished(room.gameState).finished) room.status = 'finished'
+  touch(deps, room)
+  return { ok: true, value: room }
+}
+
+export function markDisconnected(
+  deps: ServiceDeps,
+  params: { roomId: string; playerId: string },
+): ServiceResult<Room> {
+  const room = deps.store.get(params.roomId)
+  if (room === undefined) return fail('ROOM_NOT_FOUND', '房间不存在或已过期')
+
+  const player = room.players.find((candidate) => candidate.id === params.playerId)
+  if (player === undefined) return fail('NOT_IN_ROOM', '你不在这个房间里')
+
+  player.connected = false
+  if (room.hostId === player.id) {
+    const successor = room.players.find(
+      (candidate) => candidate.id !== player.id && candidate.connected,
+    )
+    if (successor !== undefined) room.hostId = successor.id
+  }
+  touch(deps, room)
+  return { ok: true, value: room }
+}
+
+/** Per-player game view; null while the room has not started. */
+export function viewFor(deps: ServiceDeps, room: Room, playerId: string): unknown | null {
+  if (room.gameState === null) return null
+  const game = deps.games.get(room.gameId)
+  if (game === undefined) return null
+  return game.getViewFor(room.gameState, playerId)
 }
