@@ -72,6 +72,14 @@ describe('applyAction', () => {
     expect(result).toEqual({ ok: false, reason: '非法的格子' })
   })
 
+  it('rejects a malformed action instead of throwing', () => {
+    const state = start()
+    const x = firstPlayer(state)
+    for (const action of [undefined, null, 'place', 42, {}, { type: 'place' }, { type: 'place', cell: '4' }]) {
+      expect(ticTacToe.applyAction(state, x, action)).toEqual({ ok: false, reason: '看不懂的动作' })
+    }
+  })
+
   it('rejects a player who is not in the game', () => {
     const state = start()
     const result = ticTacToe.applyAction(state, 'stranger', { type: 'place', cell: 0 })

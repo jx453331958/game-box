@@ -41,10 +41,10 @@ mkdir src/games/<game-id>
 类型定义在 `src/games/types.ts`：
 
 ```ts
-export interface GameLogic<S = unknown, A = unknown> {
+export interface GameLogic<S = unknown> {
   meta: GameMeta
   createInitialState(players: PlayerRef[], seed: string): S
-  applyAction(state: S, playerId: string, action: A): ActionResult<S>
+  applyAction(state: S, playerId: string, action: unknown): ActionResult<S>
   getViewFor(state: S, playerId: string): unknown
   isFinished(state: S): FinishResult
 }
@@ -56,7 +56,11 @@ export interface GameLogic<S = unknown, A = unknown> {
   产出初始状态。**任何随机性都必须来自 `seed`**，用 `src/shared/rng.ts` 的
   `createRng(seed)`/`shuffle(items, rng)`，不要用 `Math.random()`——同一个 `seed` 必须
   永远产出同一个结果，这是"用 `(seed, 动作序列)` 就能复现一局游戏"的基础。
-- **`applyAction`**：纯函数，校验 + 状态转移。**不合法的动作返回
+- **`applyAction`**：纯函数，校验 + 状态转移。`action` 的类型是 `unknown`，因为它就是
+  客户端原样发上来的东西——**先窄化再访问字段**，不要假设它长成你定义的 action 类型
+  （参考 `tic-tac-toe/logic.ts` 里的 `parseAction`：先确认是对象、`type` 对得上、
+  字段类型正确，不对就返回 `{ ok: false, reason: '看不懂的动作' }`）。直接
+  `action.cell` 这样解引用，遇到 `undefined` 会抛 `TypeError`。**不合法的动作返回
   `{ ok: false, reason: '中文原因' }`，不要抛异常**——上层 `service.ts` 靠这个返回值
   把错误变成 `room:error` 事件推给客户端，抛异常会直接把请求打挂。合法动作返回
   `{ ok: true, state: 新状态 }`，新状态是新对象（不要就地修改传入的 `state`）。
@@ -128,6 +132,10 @@ npm test && npm run typecheck
 - [ ] 随机数是否**全部**来自注入的 `seed`（`createRng`/`shuffle`），没有任何
       `Math.random()`？
 - [ ] 隐藏信息是否**只**在 `getViewFor` 里裁剪，没有在别处把完整状态明文发给客户端？
+- [ ] `applyAction` 是否**先校验 action 的形状再访问它的字段**？（`action` 的类型是
+      `unknown`，直接来自客户端，可能是 `undefined`、字符串、缺字段的对象——先窄化，
+      形状不对就返回 `{ ok: false, reason: '中文原因' }`，参考
+      `tic-tac-toe/logic.ts` 的 `parseAction`）
 - [ ] 非法动作是否都返回 `{ ok: false, reason: '中文原因' }`，没有 `throw`？
 - [ ] 状态（`createInitialState`/`applyAction` 返回的 `S`）是否是纯 JSON 结构，
       没有 `Map`/`Set`/`class` 实例/函数？

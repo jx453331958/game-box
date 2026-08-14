@@ -169,3 +169,120 @@ describe('socket flow', () => {
     expect(payload.room.players.find((player) => player.id === 'p2')!.connected).toBe(false)
   })
 })
+
+describe('malformed payloads', () => {
+  // Socket.IO does not catch exceptions thrown in an event listener, so before
+  // these guards existed either of these packets killed the process — and with
+  // it every room on the server.
+  it('rejects a join whose name is not a string, and keeps serving', async () => {
+    const roomId = makeRoom()
+    const socket = client()
+    const error = nextError(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: { evil: true } })
+    expect(await error).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
+
+    // Same connection, right after: the server is still alive and serving.
+    const sync = nextSync(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: '小明' })
+    expect((await sync).room.players[0]!.name).toBe('小明')
+  })
+
+  it('rejects an action with no payload at all, and keeps serving', async () => {
+    const roomId = makeRoom()
+    const host = client()
+    const guest = client()
+    const hostJoined = nextSync(host)
+    host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await hostJoined
+    const guestJoined = nextSync(guest)
+    guest.emit(ClientEvents.JOIN, { roomId, playerId: 'p2' })
+    await guestJoined
+    const hostStarted = nextSync(host)
+    const guestStarted = nextSync(guest)
+    host.emit(ClientEvents.START)
+    const [hostStart] = await Promise.all([hostStarted, guestStarted])
+
+    const badPayload = nextError(host)
+    host.emit(ClientEvents.ACTION)
+    expect(await badPayload).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
+
+    const badAction = nextError(host)
+    host.emit(ClientEvents.ACTION, { action: 'place' })
+    expect(await badAction).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
+
+    // An action of the right shape but with nonsense fields reaches the game,
+    // which rejects it as a move rather than throwing.
+    const mover = (hostStart.gameView as TicTacToeView).myMark === 'X' ? host : guest
+    const nonsense = nextError(mover)
+    mover.emit(ClientEvents.ACTION, { action: { type: 'place', cell: { evil: true } } })
+    expect(await nonsense).toEqual({ code: 'INVALID_ACTION', message: '看不懂的动作' })
+
+    // The room survived all three and still plays a legal move.
+    const moverSync = nextSync(mover)
+    const spectatorSync = nextSync(mover === host ? guest : host)
+    mover.emit(ClientEvents.ACTION, { action: { type: 'place', cell: 4 } })
+    const [moved] = await Promise.all([moverSync, spectatorSync])
+    expect((moved.gameView as TicTacToeView).cells[4]).not.toBeNull()
+  })
+
+  it('rejects a rename whose name is not a string', async () => {
+    const roomId = makeRoom()
+    const socket = client()
+    const joined = nextSync(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await joined
+
+    const error = nextError(socket)
+    socket.emit(ClientEvents.RENAME, { name: { evil: true } })
+    expect(await error).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
+  })
+
+  // The payload guards cannot know what a future game forgets to check, so the
+  // handler bodies also refuse to let an exception escape into the process.
+  it('answers INTERNAL when a game throws, instead of dying', async () => {
+    const throwing = {
+      ...gameRegistry,
+      get(id: string) {
+        const game = gameRegistry.get(id)
+        if (game === undefined) return undefined
+        return {
+          ...game,
+          applyAction(): never {
+            throw new TypeError("Cannot read properties of undefined (reading 'cell')")
+          },
+        }
+      },
+    }
+    const brokenDeps: ServiceDeps = { ...deps, games: throwing }
+    const broken = await createGameServer({ withNext: false, deps: brokenDeps })
+    await new Promise<void>((resolve) => broken.httpServer.listen(0, resolve))
+    const brokenUrl = `http://127.0.0.1:${(broken.httpServer.address() as AddressInfo).port}`
+
+    try {
+      const created = createRoom(brokenDeps, 'tic-tac-toe')
+      if (!created.ok) throw new Error(created.message)
+      const roomId = created.value.id
+      const sockets = ['p1', 'p2'].map((playerId) => {
+        const socket = connect(brokenUrl, { transports: ['websocket'], forceNew: true })
+        clients.push(socket)
+        return { socket, playerId }
+      })
+      for (const { socket, playerId } of sockets) {
+        const joined = nextSync(socket)
+        socket.emit(ClientEvents.JOIN, { roomId, playerId })
+        await joined
+      }
+      const [host] = sockets
+      const started = Promise.all(sockets.map(({ socket }) => nextSync(socket)))
+      host!.socket.emit(ClientEvents.START)
+      await started
+
+      const error = nextError(host!.socket)
+      host!.socket.emit(ClientEvents.ACTION, { action: { type: 'place', cell: 0 } })
+      expect(await error).toEqual({ code: 'INTERNAL', message: '服务器开小差了，请稍后重试' })
+      expect(broken.httpServer.listening).toBe(true)
+    } finally {
+      await broken.close()
+    }
+  })
+})

@@ -36,7 +36,7 @@ const LINES = [
   [2, 4, 6],
 ]
 
-export const ticTacToe: GameLogic<TicTacToeState, TicTacToeAction> = {
+export const ticTacToe: GameLogic<TicTacToeState> = {
   meta: {
     id: 'tic-tac-toe',
     name: '井字棋',
@@ -61,13 +61,16 @@ export const ticTacToe: GameLogic<TicTacToeState, TicTacToeAction> = {
     if (state.winner !== null || state.draw) return { ok: false, reason: '对局已经结束了' }
     if (!state.order.includes(playerId)) return { ok: false, reason: '你不在这局游戏里' }
     if (state.order[state.turn] !== playerId) return { ok: false, reason: '还没轮到你' }
-    if (!Number.isInteger(action.cell) || action.cell < 0 || action.cell > 8) {
+
+    const move = parseAction(action)
+    if (move === null) return { ok: false, reason: '看不懂的动作' }
+    if (!Number.isInteger(move.cell) || move.cell < 0 || move.cell > 8) {
       return { ok: false, reason: '非法的格子' }
     }
-    if (state.board[action.cell] !== null) return { ok: false, reason: '这个格子已经有人下了' }
+    if (state.board[move.cell] !== null) return { ok: false, reason: '这个格子已经有人下了' }
 
     const board = [...state.board]
-    board[action.cell] = playerId
+    board[move.cell] = playerId
     const winner = findWinner(board)
     const draw = winner === null && board.every((cell) => cell !== null)
 
@@ -101,6 +104,18 @@ export const ticTacToe: GameLogic<TicTacToeState, TicTacToeAction> = {
     if (state.draw) return { finished: true, winners: [] }
     return { finished: false, winners: [] }
   },
+}
+
+/**
+ * The action comes off the wire untrusted: narrow it here so a malformed one is
+ * a rejected move, not a TypeError inside the room's game loop.
+ */
+function parseAction(action: unknown): TicTacToeAction | null {
+  if (typeof action !== 'object' || action === null) return null
+  const candidate = action as { type?: unknown; cell?: unknown }
+  if (candidate.type !== 'place') return null
+  if (typeof candidate.cell !== 'number') return null
+  return { type: 'place', cell: candidate.cell }
 }
 
 function findWinner(board: (string | null)[]): string | null {
