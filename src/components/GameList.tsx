@@ -12,21 +12,26 @@ export function GameList({ games }: { games: GameMeta[] }) {
   async function createRoom(gameId: string) {
     setPendingId(gameId)
     setError(null)
-    const response = await fetch('/api/rooms', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ gameId }),
-    })
-    const body = (await response.json().catch(() => null)) as
-      | { ok: true; roomId: string }
-      | { ok: false; message: string }
-      | null
-    setPendingId(null)
-    if (body === null || !body.ok) {
-      setError(body?.message ?? '创建房间失败')
-      return
+    try {
+      const response = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ gameId }),
+      })
+      const body = (await response.json().catch(() => null)) as
+        | { ok: true; roomId: string }
+        | { ok: false; message: string }
+        | null
+      if (body === null || !body.ok) {
+        setError(body?.message ?? '创建房间失败')
+        return
+      }
+      router.push(`/room/${body.roomId}`)
+    } catch {
+      setError('创建房间失败，请重试')
+    } finally {
+      setPendingId(null)
     }
-    router.push(`/room/${body.roomId}`)
   }
 
   if (games.length === 0) {

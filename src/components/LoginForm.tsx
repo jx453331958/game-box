@@ -13,19 +13,24 @@ export function LoginForm() {
     event.preventDefault()
     setPending(true)
     setError(null)
-    const response = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ password }),
-    })
-    setPending(false)
-    if (!response.ok) {
-      const body = (await response.json().catch(() => null)) as { message?: string } | null
-      setError(body?.message ?? '登录失败')
-      return
+    try {
+      const response = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password }),
+      })
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { message?: string } | null
+        setError(body?.message ?? '登录失败')
+        return
+      }
+      router.replace('/')
+      router.refresh()
+    } catch {
+      setError('登录失败，请重试')
+    } finally {
+      setPending(false)
     }
-    router.replace('/')
-    router.refresh()
   }
 
   return (
