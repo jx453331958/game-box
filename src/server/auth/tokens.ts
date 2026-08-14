@@ -20,8 +20,10 @@ function unsign(signed: string, secret: string): string | null {
   const payload = signed.slice(0, separator)
   const provided = signed.slice(separator + 1)
   const expected = createHmac('sha256', secret).update(payload).digest('hex')
-  if (provided.length !== expected.length) return null
-  if (!timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) return null
+  const providedBuf = Buffer.from(provided)
+  const expectedBuf = Buffer.from(expected)
+  if (providedBuf.length !== expectedBuf.length) return null
+  if (!timingSafeEqual(providedBuf, expectedBuf)) return null
   return payload
 }
 

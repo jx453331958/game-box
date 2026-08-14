@@ -46,6 +46,12 @@ describe('session cookie', () => {
   it('uses a stable cookie name', () => {
     expect(SESSION_COOKIE).toBe('gb_session')
   })
+
+  it('rejects a multi-byte signature without throwing, even when its code-unit length matches the hex MAC length', () => {
+    const value = `session:123.${'中'.repeat(64)}`
+    expect(() => isSessionValid(value, SECRET, NOW)).not.toThrow()
+    expect(isSessionValid(value, SECRET, NOW)).toBe(false)
+  })
 })
 
 describe('grant cookie', () => {
@@ -66,6 +72,12 @@ describe('grant cookie', () => {
 
   it('namespaces the cookie per room', () => {
     expect(grantCookieName('ABC234')).toBe('gb_grant_ABC234')
+  })
+
+  it('rejects a multi-byte signature without throwing, even when its code-unit length matches the hex MAC length', () => {
+    const value = `grant:ABC234:123.${'中'.repeat(64)}`
+    expect(() => isGrantValid(value, 'ABC234', SECRET, NOW)).not.toThrow()
+    expect(isGrantValid(value, 'ABC234', SECRET, NOW)).toBe(false)
   })
 })
 
