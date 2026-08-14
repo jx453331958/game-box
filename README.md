@@ -24,6 +24,7 @@ APP_PASSWORD=dev-pw SESSION_SECRET=dev-secret-key npm run dev
 | `npm run dev` | 启动开发服务器（`tsx watch`，带热重载） |
 | `npm test` | 跑全部单元/集成测试（vitest） |
 | `npm run typecheck` | `tsc --noEmit`，只检查类型不产出文件 |
+| `npm run lint` | ESLint（Next 官方规则集），警告也算失败（`--max-warnings=0`） |
 | `npm run build` | 构建生产版本：`next build` + esbuild 打包自定义 server 到 `dist/server.js` |
 | `npm start` | 运行已构建产物（`node dist/server.js`），需要先 `npm run build` |
 

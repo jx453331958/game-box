@@ -10,6 +10,7 @@
 | --- | --- |
 | `npm test` | **改动后必须跑**，vitest，跑全部测试（含 `src/games/boundaries.test.ts` 这道纯度检查） |
 | `npm run typecheck` | `tsc --noEmit`，提交前跑 |
+| `npm run lint` | ESLint（`next/core-web-vitals` + `next/typescript`，flat config），`--max-warnings=0`，提交前跑 |
 | `npm run dev` | 本地跑起来看效果：`APP_PASSWORD=dev-pw SESSION_SECRET=dev-secret-key npm run dev` |
 | `npm run build` | 生产构建：`next build` 出 `.next/`，esbuild 把 `src/server/index.ts` 打包成 `dist/server.js` |
 
