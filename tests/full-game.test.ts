@@ -2,7 +2,7 @@ import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { io as connect, type Socket } from 'socket.io-client'
 import { gameRegistry } from '../src/games/registry'
-import type { TicTacToeView } from '../src/games/tic-tac-toe/logic'
+import type { Mark, TicTacToeView } from '../src/games/tic-tac-toe/logic'
 import { createGameServer } from '../src/server/app'
 import { createRoom, type ServiceDeps } from '../src/server/rooms/service'
 import { createRoomStore } from '../src/server/rooms/store'
@@ -67,7 +67,7 @@ describe('full game over the wire', () => {
     const guestSeesOwnRename = nextSync(guest)
     guest.emit(ClientEvents.RENAME, { name: '小花' })
     expect((await hostSeesRename).room.players[1]!.name).toBe('小花')
-    await guestSeesOwnRename
+    expect((await guestSeesOwnRename).room.players[1]!.name).toBe('小花')
 
     // 3. The host starts the game.
     const hostStarted = nextSync(host)
@@ -76,13 +76,17 @@ describe('full game over the wire', () => {
     const [hostStart, guestStart] = await Promise.all([hostStarted, guestStarted])
     expect(hostStart.room.status).toBe('playing')
 
-    const hostIsX = (hostStart.gameView as TicTacToeView).myMark === 'X'
-    expect((guestStart.gameView as TicTacToeView).myMark).toBe(hostIsX ? 'O' : 'X')
+    const hostMark = (hostStart.gameView as TicTacToeView).myMark as Mark
+    const guestMark = (guestStart.gameView as TicTacToeView).myMark as Mark
+    const hostIsX = hostMark === 'X'
+    expect(guestMark).toBe(hostIsX ? 'O' : 'X')
 
     // 4. X takes cells 0,1,2 while O answers on 3,4 — X wins on the top row.
     const xSocket = hostIsX ? host : guest
     const oSocket = hostIsX ? guest : host
     const xId = hostIsX ? 'p1' : 'p2'
+    const xMark = hostIsX ? hostMark : guestMark
+    const oMark = hostIsX ? guestMark : hostMark
 
     // Every move broadcasts to both sockets in the room, not just the mover, so both
     // copies must be drained before the next move registers a fresh listener — otherwise
@@ -120,6 +124,10 @@ describe('full game over the wire', () => {
     })
     expect(rejoined.room.status).toBe('finished')
     const rejoinedView = rejoined.gameView as TicTacToeView
-    expect(rejoinedView.cells.filter((cell) => cell !== null)).toHaveLength(5)
+    // Exact board, not just a count: cells 0,1,2 are X's winning row, 3,4 are O's replies,
+    // and the rest are untouched. A garbled replay (swapped marks, shuffled positions,
+    // the wrong player's view) would still have 5 filled cells but fail this comparison.
+    const expectedCells: (Mark | null)[] = [xMark, xMark, xMark, oMark, oMark, null, null, null, null]
+    expect(rejoinedView.cells).toEqual(expectedCells)
   })
 })
