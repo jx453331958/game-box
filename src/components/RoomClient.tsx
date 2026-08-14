@@ -93,7 +93,7 @@ export function RoomClient({ roomId }: { roomId: string }) {
 
       {room.status !== 'waiting' && Board !== undefined && gameView !== null && (
         <section className="space-y-4">
-          <Board view={gameView as never} me={playerId as never} onAction={act as never} />
+          <Board view={gameView} me={playerId} onAction={act} />
           {room.status === 'finished' && (
             <p className="text-lg font-medium">
               {room.winners.length === 0

@@ -39,4 +39,14 @@ export type BoardProps<V = unknown, A = unknown> = {
   onAction: (action: A) => void
 }
 
-export type BoardComponent = ComponentType<BoardProps<never, never>>
+/**
+ * Registry-side erasure of `BoardProps`. The room screen holds a `view` and an
+ * `onAction` it cannot type (it does not know which game is loaded), so the
+ * props are erased to `unknown` here instead of `never`: one cast at
+ * registration, none at the call site, and `me` stays a plain `string`.
+ */
+export type BoardComponent = ComponentType<{
+  view: unknown
+  me: string
+  onAction: (action: unknown) => void
+}>
