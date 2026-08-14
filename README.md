@@ -41,6 +41,17 @@ docker compose up -d --build
 都不会起来；这是有意为之——一个没有密码保护的部署不应该悄悄跑起来。容器内置 `/api/health`
 健康检查。
 
+### 密码强度
+
+`APP_PASSWORD` 是整个站点唯一的一道门，而且暴露在公网上：
+
+- **至少 16 位随机字符**，`openssl rand -base64 18` 生成一个即可（要报给朋友听的话，
+  也可以用四五个不相关的词拼起来，但别用生日、站点名、常见单词）。
+- 登录接口有失败次数限制（同一来源 IP 10 分钟内最多 10 次失败，见
+  `src/server/auth/rate-limit.ts`），但那只能拖慢爆破，**挡不住弱密码**。
+- `SESSION_SECRET` 不需要人念，直接 `openssl rand -hex 32`；它一变，所有人的登录状态和
+  未过期的邀请凭证立即失效。
+
 ### 反向代理
 
 游戏依赖 Socket.IO（WebSocket）实时同步棋盘。反向代理如果不转发 `Upgrade` / `Connection`

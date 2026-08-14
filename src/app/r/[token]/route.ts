@@ -18,6 +18,9 @@ export async function GET(request: Request, context: { params: Promise<{ token: 
     value: createGrantValue(room.id, Date.now(), getConfig().sessionSecret),
     httpOnly: true,
     sameSite: 'lax',
+    // See the note in src/app/api/login/route.ts: the browser-facing origin is
+    // HTTPS, and http://localhost is exempt from the Secure requirement.
+    secure: true,
     path: '/',
     maxAge: Math.floor(GRANT_MAX_AGE_MS / 1000),
   })
