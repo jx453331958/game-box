@@ -4,6 +4,7 @@ dist
 .git
 .worktrees
 docs
+.superpowers
 *.log
 .env
 .env.local
