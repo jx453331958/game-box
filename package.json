@@ -19,7 +19,7 @@
   "author": "",
   "license": "ISC",
   "type": "commonjs",
-  "private": "true",
+  "private": true,
   "dependencies": {
     "next": "^15.5.23",
     "react": "^19.2.8",
