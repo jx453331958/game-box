@@ -1,0 +1,380 @@
+import type { AddressInfo } from 'node:net'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { io as connect, type Socket } from 'socket.io-client'
+import { gameRegistry } from '../src/games/registry'
+import type { TicTacToeView } from '../src/games/tic-tac-toe/logic'
+import { createGameServer } from '../src/server/app'
+import {
+  createGrantValue,
+  createSessionValue,
+  grantCookieName,
+  SESSION_COOKIE,
+} from '../src/server/auth/tokens'
+import { createRoom, type ServiceDeps } from '../src/server/rooms/service'
+import { createRoomStore } from '../src/server/rooms/store'
+import { SOCKET_AUTH_ERROR } from '../src/server/socket/auth'
+import { ClientEvents, ServerEvents, type ErrorPayload, type SyncPayload } from '../src/shared/events'
+
+/** The handshake auth is under test too, so the tests mint real credentials. */
+const SESSION_SECRET = 'test-session-secret'
+
+let server: Awaited<ReturnType<typeof createGameServer>>
+let deps: ServiceDeps
+let url: string
+const clients: Socket[] = []
+
+beforeEach(async () => {
+  deps = { store: createRoomStore(), games: gameRegistry, now: () => Date.now() }
+  server = await createGameServer({ withNext: false, deps, sessionSecret: SESSION_SECRET })
+  await new Promise<void>((resolve) => server.httpServer.listen(0, resolve))
+  const address = server.httpServer.address() as AddressInfo
+  url = `http://127.0.0.1:${address.port}`
+})
+
+afterEach(async () => {
+  for (const client of clients.splice(0)) client.close()
+  await server.close()
+})
+
+function sessionCookie(): string {
+  return `${SESSION_COOKIE}=${createSessionValue(Date.now(), SESSION_SECRET)}`
+}
+
+/** Connects the way a logged-in browser does: site session cookie + room claim. */
+function client(roomId: string, cookie: string = sessionCookie()): Socket {
+  const socket = connect(url, {
+    transports: ['websocket'],
+    forceNew: true,
+    auth: { roomId },
+    extraHeaders: { cookie },
+  })
+  clients.push(socket)
+  return socket
+}
+
+function nextSync(socket: Socket): Promise<SyncPayload> {
+  return new Promise((resolve) => socket.once(ServerEvents.SYNC, resolve))
+}
+
+function nextError(socket: Socket): Promise<ErrorPayload> {
+  return new Promise((resolve) => socket.once(ServerEvents.ERROR, resolve))
+}
+
+function makeRoom(): string {
+  const result = createRoom(deps, 'tic-tac-toe')
+  if (!result.ok) throw new Error(result.message)
+  return result.value.id
+}
+
+describe('socket flow', () => {
+  it('syncs the room back to a joining player', async () => {
+    const roomId = makeRoom()
+    const socket = client(roomId)
+    const sync = nextSync(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: '小明' })
+    const payload = await sync
+    expect(payload.room.id).toBe(roomId)
+    expect(payload.room.players).toHaveLength(1)
+    expect(payload.room.players[0]!.name).toBe('小明')
+    expect(payload.room.hostId).toBe('p1')
+    expect(payload.gameView).toBeNull()
+  })
+
+  it('broadcasts the new roster to everyone in the room', async () => {
+    const roomId = makeRoom()
+    const host = client(roomId)
+    const hostSync = nextSync(host)
+    host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: '小明' })
+    await hostSync
+
+    const hostSeesGuest = nextSync(host)
+    const guest = client(roomId)
+    guest.emit(ClientEvents.JOIN, { roomId, playerId: 'p2', name: '小红' })
+    const payload = await hostSeesGuest
+    expect(payload.room.players.map((player) => player.name)).toEqual(['小明', '小红'])
+  })
+
+  it('reports a missing room as an error rather than a sync', async () => {
+    // A site session authorises any room, so the handshake passes and the
+    // "no such room" answer comes from the service layer as before.
+    const socket = client('NOPE12')
+    const error = nextError(socket)
+    socket.emit(ClientEvents.JOIN, { roomId: 'NOPE12', playerId: 'p1' })
+    expect(await error).toEqual({ code: 'ROOM_NOT_FOUND', message: '房间不存在或已过期' })
+  })
+
+  it('renames a player and broadcasts it', async () => {
+    const roomId = makeRoom()
+    const socket = client(roomId)
+    const joined = nextSync(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await joined
+
+    const renamed = nextSync(socket)
+    socket.emit(ClientEvents.RENAME, { name: '新名字' })
+    expect((await renamed).room.players[0]!.name).toBe('新名字')
+  })
+
+  it('lets the host start the game and gives each player their own view', async () => {
+    const roomId = makeRoom()
+    const host = client(roomId)
+    const guest = client(roomId)
+    const hostJoined = nextSync(host)
+    host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await hostJoined
+    const guestJoined = nextSync(guest)
+    guest.emit(ClientEvents.JOIN, { roomId, playerId: 'p2' })
+    await guestJoined
+
+    const hostStarted = nextSync(host)
+    const guestStarted = nextSync(guest)
+    host.emit(ClientEvents.START)
+    const [hostPayload, guestPayload] = await Promise.all([hostStarted, guestStarted])
+
+    expect(hostPayload.room.status).toBe('playing')
+    const hostView = hostPayload.gameView as TicTacToeView
+    const guestView = guestPayload.gameView as TicTacToeView
+    expect(new Set([hostView.myMark, guestView.myMark])).toEqual(new Set(['X', 'O']))
+  })
+
+  it('rejects a start from a non-host', async () => {
+    const roomId = makeRoom()
+    const host = client(roomId)
+    const guest = client(roomId)
+    const hostJoined = nextSync(host)
+    host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await hostJoined
+    const guestJoined = nextSync(guest)
+    guest.emit(ClientEvents.JOIN, { roomId, playerId: 'p2' })
+    await guestJoined
+
+    const error = nextError(guest)
+    guest.emit(ClientEvents.START)
+    expect(await error).toEqual({ code: 'NOT_HOST', message: '只有房主可以开始游戏' })
+  })
+
+  it('sends an illegal move back only to the player who made it', async () => {
+    const roomId = makeRoom()
+    const host = client(roomId)
+    const guest = client(roomId)
+    const hostJoined = nextSync(host)
+    host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await hostJoined
+    const guestJoined = nextSync(guest)
+    guest.emit(ClientEvents.JOIN, { roomId, playerId: 'p2' })
+    await guestJoined
+    const started = nextSync(host)
+    host.emit(ClientEvents.START)
+    const startPayload = await started
+
+    const hostView = startPayload.gameView as TicTacToeView
+    const waiting = hostView.myMark === 'X' ? guest : host
+    const error = nextError(waiting)
+    waiting.emit(ClientEvents.ACTION, { action: { type: 'place', cell: 0 } })
+    expect(await error).toEqual({ code: 'INVALID_ACTION', message: '还没轮到你' })
+  })
+
+  it('marks a player offline when their socket drops', async () => {
+    const roomId = makeRoom()
+    const host = client(roomId)
+    const guest = client(roomId)
+    const hostJoined = nextSync(host)
+    host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await hostJoined
+    const guestJoined = nextSync(guest)
+    guest.emit(ClientEvents.JOIN, { roomId, playerId: 'p2' })
+    await guestJoined
+
+    const hostNotified = nextSync(host)
+    guest.close()
+    const payload = await hostNotified
+    expect(payload.room.players.find((player) => player.id === 'p2')!.connected).toBe(false)
+  })
+})
+
+describe('malformed payloads', () => {
+  // Socket.IO does not catch exceptions thrown in an event listener, so before
+  // these guards existed either of these packets killed the process — and with
+  // it every room on the server.
+  it('rejects a join whose name is not a string, and keeps serving', async () => {
+    const roomId = makeRoom()
+    const socket = client(roomId)
+    const error = nextError(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: { evil: true } })
+    expect(await error).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
+
+    // Same connection, right after: the server is still alive and serving.
+    const sync = nextSync(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: '小明' })
+    expect((await sync).room.players[0]!.name).toBe('小明')
+  })
+
+  it('rejects an action with no payload at all, and keeps serving', async () => {
+    const roomId = makeRoom()
+    const host = client(roomId)
+    const guest = client(roomId)
+    const hostJoined = nextSync(host)
+    host.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await hostJoined
+    const guestJoined = nextSync(guest)
+    guest.emit(ClientEvents.JOIN, { roomId, playerId: 'p2' })
+    await guestJoined
+    const hostStarted = nextSync(host)
+    const guestStarted = nextSync(guest)
+    host.emit(ClientEvents.START)
+    const [hostStart] = await Promise.all([hostStarted, guestStarted])
+
+    const badPayload = nextError(host)
+    host.emit(ClientEvents.ACTION)
+    expect(await badPayload).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
+
+    const badAction = nextError(host)
+    host.emit(ClientEvents.ACTION, { action: 'place' })
+    expect(await badAction).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
+
+    // An action of the right shape but with nonsense fields reaches the game,
+    // which rejects it as a move rather than throwing.
+    const mover = (hostStart.gameView as TicTacToeView).myMark === 'X' ? host : guest
+    const nonsense = nextError(mover)
+    mover.emit(ClientEvents.ACTION, { action: { type: 'place', cell: { evil: true } } })
+    expect(await nonsense).toEqual({ code: 'INVALID_ACTION', message: '看不懂的动作' })
+
+    // The room survived all three and still plays a legal move.
+    const moverSync = nextSync(mover)
+    const spectatorSync = nextSync(mover === host ? guest : host)
+    mover.emit(ClientEvents.ACTION, { action: { type: 'place', cell: 4 } })
+    const [moved] = await Promise.all([moverSync, spectatorSync])
+    expect((moved.gameView as TicTacToeView).cells[4]).not.toBeNull()
+  })
+
+  it('rejects a rename whose name is not a string', async () => {
+    const roomId = makeRoom()
+    const socket = client(roomId)
+    const joined = nextSync(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1' })
+    await joined
+
+    const error = nextError(socket)
+    socket.emit(ClientEvents.RENAME, { name: { evil: true } })
+    expect(await error).toEqual({ code: 'BAD_PAYLOAD', message: '请求格式不正确' })
+  })
+
+  // The payload guards cannot know what a future game forgets to check, so the
+  // handler bodies also refuse to let an exception escape into the process.
+  it('answers INTERNAL when a game throws, instead of dying', async () => {
+    const throwing = {
+      ...gameRegistry,
+      get(id: string) {
+        const game = gameRegistry.get(id)
+        if (game === undefined) return undefined
+        return {
+          ...game,
+          applyAction(): never {
+            throw new TypeError("Cannot read properties of undefined (reading 'cell')")
+          },
+        }
+      },
+    }
+    const brokenDeps: ServiceDeps = { ...deps, games: throwing }
+    const broken = await createGameServer({
+      withNext: false,
+      deps: brokenDeps,
+      sessionSecret: SESSION_SECRET,
+    })
+    await new Promise<void>((resolve) => broken.httpServer.listen(0, resolve))
+    const brokenUrl = `http://127.0.0.1:${(broken.httpServer.address() as AddressInfo).port}`
+
+    try {
+      const created = createRoom(brokenDeps, 'tic-tac-toe')
+      if (!created.ok) throw new Error(created.message)
+      const roomId = created.value.id
+      const sockets = ['p1', 'p2'].map((playerId) => {
+        const socket = connect(brokenUrl, {
+          transports: ['websocket'],
+          forceNew: true,
+          auth: { roomId },
+          extraHeaders: { cookie: sessionCookie() },
+        })
+        clients.push(socket)
+        return { socket, playerId }
+      })
+      for (const { socket, playerId } of sockets) {
+        const joined = nextSync(socket)
+        socket.emit(ClientEvents.JOIN, { roomId, playerId })
+        await joined
+      }
+      const [host] = sockets
+      const started = Promise.all(sockets.map(({ socket }) => nextSync(socket)))
+      host!.socket.emit(ClientEvents.START)
+      await started
+
+      const error = nextError(host!.socket)
+      host!.socket.emit(ClientEvents.ACTION, { action: { type: 'place', cell: 0 } })
+      expect(await error).toEqual({ code: 'INTERNAL', message: '服务器开小差了，请稍后重试' })
+      expect(broken.httpServer.listening).toBe(true)
+    } finally {
+      await broken.close()
+    }
+  })
+})
+
+describe('handshake auth', () => {
+  function connectError(socket: Socket): Promise<string> {
+    return new Promise((resolve) => socket.once('connect_error', (cause) => resolve(cause.message)))
+  }
+
+  function rawClient(options: Record<string, unknown>): Socket {
+    const socket = connect(url, { transports: ['websocket'], forceNew: true, ...options })
+    clients.push(socket)
+    return socket
+  }
+
+  it('rejects a handshake that carries no cookies at all', async () => {
+    const roomId = makeRoom()
+    const socket = rawClient({ auth: { roomId } })
+    expect(await connectError(socket)).toBe(SOCKET_AUTH_ERROR)
+    expect(socket.connected).toBe(false)
+  })
+
+  it('rejects a handshake that declares no room', async () => {
+    makeRoom()
+    const socket = rawClient({ extraHeaders: { cookie: sessionCookie() } })
+    expect(await connectError(socket)).toBe(SOCKET_AUTH_ERROR)
+  })
+
+  it('rejects a forged session cookie', async () => {
+    const roomId = makeRoom()
+    const socket = rawClient({
+      auth: { roomId },
+      extraHeaders: { cookie: `${SESSION_COOKIE}=session:${Date.now()}.deadbeef` },
+    })
+    expect(await connectError(socket)).toBe(SOCKET_AUTH_ERROR)
+  })
+
+  it('accepts an invite grant for that room', async () => {
+    const roomId = makeRoom()
+    const grant = `${grantCookieName(roomId)}=${createGrantValue(roomId, Date.now(), SESSION_SECRET)}`
+    const socket = client(roomId, grant)
+    const sync = nextSync(socket)
+    socket.emit(ClientEvents.JOIN, { roomId, playerId: 'p1', name: '客人' })
+    expect((await sync).room.id).toBe(roomId)
+  })
+
+  it('does not let a grant for one room open another', async () => {
+    const mine = makeRoom()
+    const other = makeRoom()
+    const grant = `${grantCookieName(mine)}=${createGrantValue(mine, Date.now(), SESSION_SECRET)}`
+    const socket = rawClient({ auth: { roomId: other }, extraHeaders: { cookie: grant } })
+    expect(await connectError(socket)).toBe(SOCKET_AUTH_ERROR)
+  })
+
+  it('refuses to join a room the handshake was not authorised for', async () => {
+    const mine = makeRoom()
+    const other = makeRoom()
+    const grant = `${grantCookieName(mine)}=${createGrantValue(mine, Date.now(), SESSION_SECRET)}`
+    const socket = client(mine, grant)
+    const error = nextError(socket)
+    socket.emit(ClientEvents.JOIN, { roomId: other, playerId: 'p1' })
+    expect(await error).toEqual({ code: 'FORBIDDEN', message: '你没有权限进入这个房间' })
+  })
+})
